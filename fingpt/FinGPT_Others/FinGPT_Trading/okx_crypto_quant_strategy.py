@@ -1,13 +1,12 @@
-"""OKX demo-trading quant strategy template for BTC/ETH + meme coins.
+"""Conservative BTC 4H long-only strategy with OKX demo integration.
 
-This script implements:
-1) Asset split: 80% major coins (BTC/ETH), 20% meme coins.
-2) Leverage rules:
-   - BTC/ETH: default 2-3x, hard cap 5x.
-   - Meme coins: default 5-10x, high-momentum mode 15-20x.
-3) Position sizing + risk guardrails.
-4) OKX simulated trading via ccxt (set exchange option "flag"="1").
-5) Post-trade self-review and strategy optimization suggestions.
+This revision keeps the previous framework (config + logging + post-trade self-review),
+but replaces the high-turnover multi-asset core with a stricter BTC-only trading logic:
+- Universe: BTC perpetual only (default)
+- Timeframe: 4H
+- Direction: long-only
+- Filters: ADX + MA slope + Donchian breakout
+- Risk: ATR stop, staged take-profit, leverage cap
 
 Disclaimer: educational use only; not financial advice.
 """
@@ -17,10 +16,10 @@ from __future__ import annotations
 import json
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import ccxt  # type: ignore
 import numpy as np
@@ -29,34 +28,37 @@ import pandas as pd
 
 @dataclass
 class StrategyConfig:
-    # Portfolio
-    major_symbols: List[str] = field(default_factory=lambda: ["BTC/USDT:USDT", "ETH/USDT:USDT"])
-    meme_symbols: List[str] = field(default_factory=lambda: ["DOGE/USDT:USDT", "PEPE/USDT:USDT"])
-    major_weight: float = 0.80
-    meme_weight: float = 0.20
+    symbol: str = "BTC/USDT:USDT"
+    timeframe: str = "4h"
+    ohlcv_limit: int = 400
 
-    # Leverage constraints
-    major_default_leverage: int = 3
-    major_max_leverage: int = 5
-    meme_default_leverage: int = 8
-    meme_high_momentum_leverage: int = 15
-    meme_extreme_momentum_leverage: int = 20
-    meme_max_leverage: int = 20
+    # leverage/risk
+    leverage: int = 3
+    max_leverage: int = 5
+    risk_per_trade: float = 0.01
+    max_position_value_ratio: float = 0.80
 
-    # Risk controls
-    per_trade_risk_pct: float = 0.01   # 1% equity max risk per trade
-    stop_loss_pct: float = 0.02        # 2% stop loss
-    take_profit_pct: float = 0.04      # 4% take profit
-    rebalance_interval_sec: int = 300
-    ohlcv_timeframe: str = "1h"
-    ohlcv_limit: int = 200
+    # filters
+    adx_period: int = 14
+    adx_min: float = 20.0
+    ma_fast: int = 20
+    ma_slow: int = 60
+    donchian_window: int = 20
 
-    # Runtime
+    # exits
+    atr_period: int = 14
+    atr_stop_mult: float = 2.0
+    tp1_atr_mult: float = 1.5
+    tp2_atr_mult: float = 3.0
+    tp1_reduce_ratio: float = 0.5
+
+    # ops
     dry_run: bool = True
+    min_bars_between_entries: int = 3
     review_log_path: str = "fingpt/FinGPT_Others/FinGPT_Trading/trade_review_log.jsonl"
 
 
-class OKXCryptoQuantStrategy:
+class OKXBTC4HLongOnlyStrategy:
     def __init__(self, config: StrategyConfig):
         self.config = config
         self.exchange = self._build_exchange()
@@ -64,201 +66,195 @@ class OKXCryptoQuantStrategy:
         self.review_log.parent.mkdir(parents=True, exist_ok=True)
 
     def _build_exchange(self):
-        api_key = os.getenv("OKX_API_KEY", "")
-        secret = os.getenv("OKX_SECRET", "")
-        password = os.getenv("OKX_PASSWORD", "")
-
         return ccxt.okx(
             {
-                "apiKey": api_key,
-                "secret": secret,
-                "password": password,
+                "apiKey": os.getenv("OKX_API_KEY", ""),
+                "secret": os.getenv("OKX_SECRET", ""),
+                "password": os.getenv("OKX_PASSWORD", ""),
                 "enableRateLimit": True,
                 "options": {
                     "defaultType": "swap",
-                    "flag": "1",  # OKX demo trading
+                    "flag": "1",  # OKX demo
                 },
             }
         )
 
     @staticmethod
-    def _calc_indicators(df: pd.DataFrame) -> pd.DataFrame:
-        close = df["close"]
-        df["ema_fast"] = close.ewm(span=20, adjust=False).mean()
-        df["ema_slow"] = close.ewm(span=60, adjust=False).mean()
+    def _adx(df: pd.DataFrame, n: int) -> pd.Series:
+        high, low, close = df["high"], df["low"], df["close"]
+        up_move = high.diff()
+        down_move = -low.diff()
 
-        delta = close.diff()
-        gain = np.where(delta > 0, delta, 0.0)
-        loss = np.where(delta < 0, -delta, 0.0)
-        roll_up = pd.Series(gain).rolling(14).mean()
-        roll_down = pd.Series(loss).rolling(14).mean()
-        rs = roll_up / (roll_down + 1e-12)
-        df["rsi"] = 100 - (100 / (1 + rs))
+        plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+        minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
 
-        df["ret"] = close.pct_change()
-        df["volatility"] = df["ret"].rolling(24).std() * np.sqrt(24)
+        tr1 = high - low
+        tr2 = (high - close.shift(1)).abs()
+        tr3 = (low - close.shift(1)).abs()
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+        atr = tr.rolling(n).mean()
+        plus_di = 100 * pd.Series(plus_dm, index=df.index).rolling(n).mean() / (atr + 1e-12)
+        minus_di = 100 * pd.Series(minus_dm, index=df.index).rolling(n).mean() / (atr + 1e-12)
+        dx = ((plus_di - minus_di).abs() / (plus_di + minus_di + 1e-12)) * 100
+        return dx.rolling(n).mean()
+
+    def _features(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        df["ma_fast"] = df["close"].rolling(self.config.ma_fast).mean()
+        df["ma_slow"] = df["close"].rolling(self.config.ma_slow).mean()
+        df["ma_slow_slope"] = df["ma_slow"].diff(3)
+
+        tr = pd.concat(
+            [
+                df["high"] - df["low"],
+                (df["high"] - df["close"].shift(1)).abs(),
+                (df["low"] - df["close"].shift(1)).abs(),
+            ],
+            axis=1,
+        ).max(axis=1)
+        df["atr"] = tr.rolling(self.config.atr_period).mean()
+        df["adx"] = self._adx(df, self.config.adx_period)
+
+        df["donchian_high_prev"] = df["high"].rolling(self.config.donchian_window).max().shift(1)
+        df["donchian_low_prev"] = df["low"].rolling(self.config.donchian_window).min().shift(1)
         return df
 
-    def _fetch_ohlcv(self, symbol: str) -> pd.DataFrame:
+    def _fetch_ohlcv(self) -> pd.DataFrame:
         rows = self.exchange.fetch_ohlcv(
-            symbol,
-            timeframe=self.config.ohlcv_timeframe,
+            self.config.symbol,
+            timeframe=self.config.timeframe,
             limit=self.config.ohlcv_limit,
         )
         df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-        return self._calc_indicators(df)
+        return self._features(df)
 
-    def _signal(self, df: pd.DataFrame, is_meme: bool) -> Tuple[str, float]:
+    def _entry_signal(self, df: pd.DataFrame) -> Dict:
         row = df.iloc[-1]
-        trend_long = row["ema_fast"] > row["ema_slow"]
-        trend_short = row["ema_fast"] < row["ema_slow"]
+        valid = (
+            (row["close"] > row["donchian_high_prev"])
+            and (row["ma_fast"] > row["ma_slow"])
+            and (row["ma_slow_slope"] > 0)
+            and (row["adx"] >= self.config.adx_min)
+        )
+        return {
+            "signal": "buy" if valid else "hold",
+            "reason": {
+                "breakout": bool(row["close"] > row["donchian_high_prev"]),
+                "ma_trend": bool(row["ma_fast"] > row["ma_slow"]),
+                "ma_slope_pos": bool(row["ma_slow_slope"] > 0),
+                "adx_ok": bool(row["adx"] >= self.config.adx_min),
+            },
+        }
 
-        momentum = abs(float(df["ret"].tail(6).sum()))
+    def _position_notional(self, equity: float, price: float, atr: float) -> float:
+        leverage = min(self.config.leverage, self.config.max_leverage)
+        risk_cap = equity * self.config.risk_per_trade
+        stop_distance = max(atr * self.config.atr_stop_mult, price * 0.003)
+        qty_by_risk = risk_cap / max(stop_distance, 1e-9)
+        notional_by_risk = qty_by_risk * price
 
-        if trend_long and row["rsi"] < 68:
-            return "buy", momentum
-        if trend_short and row["rsi"] > 32:
-            return "sell", momentum
+        max_notional = equity * self.config.max_position_value_ratio * leverage
+        return float(min(notional_by_risk, max_notional))
 
-        # Meme coins can trade momentum breakout signals more aggressively.
-        if is_meme:
-            breakout_up = row["close"] > df["high"].tail(20).max() * 0.995
-            breakout_down = row["close"] < df["low"].tail(20).min() * 1.005
-            if breakout_up:
-                return "buy", max(momentum, 0.06)
-            if breakout_down:
-                return "sell", max(momentum, 0.06)
-
-        return "hold", momentum
-
-    def _decide_leverage(self, is_meme: bool, momentum: float) -> int:
-        if not is_meme:
-            return min(self.config.major_default_leverage, self.config.major_max_leverage)
-
-        if momentum >= 0.12:
-            return self.config.meme_extreme_momentum_leverage
-        if momentum >= 0.08:
-            return self.config.meme_high_momentum_leverage
-        return self.config.meme_default_leverage
-
-    def _position_notional(self, equity: float, symbol: str, leverage: int, is_meme: bool) -> float:
-        bucket_weight = self.config.meme_weight if is_meme else self.config.major_weight
-        universe_size = len(self.config.meme_symbols) if is_meme else len(self.config.major_symbols)
-        symbol_weight = bucket_weight / max(universe_size, 1)
-
-        # risk-based cap
-        max_risk_notional = equity * self.config.per_trade_risk_pct / self.config.stop_loss_pct
-        target_notional = equity * symbol_weight * leverage
-        return float(min(target_notional, max_risk_notional))
-
-    def _set_leverage(self, symbol: str, leverage: int) -> None:
+    def _set_leverage(self, leverage: int) -> None:
         if self.config.dry_run:
             return
-        try:
-            self.exchange.set_leverage(leverage, symbol)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[WARN] set_leverage failed for {symbol}: {exc}")
+        self.exchange.set_leverage(leverage, self.config.symbol)
 
-    def _place_order(self, symbol: str, side: str, notional: float, price: float) -> Dict:
-        amount = max(notional / max(price, 1e-9), 0)
+    def _order(self, side: str, amount: float) -> Dict:
         if self.config.dry_run:
             return {
                 "id": f"paper-{int(time.time()*1000)}",
-                "symbol": symbol,
+                "symbol": self.config.symbol,
                 "side": side,
                 "amount": amount,
-                "price": price,
                 "status": "closed",
                 "dry_run": True,
             }
+        return self.exchange.create_order(self.config.symbol, "market", side, amount)
 
-        return self.exchange.create_order(symbol, "market", side, amount)
-
-    def _self_review(self, trade: Dict, signal: str, momentum: float, is_meme: bool) -> Dict:
-        issues = []
-        optimizations = []
+    def _self_review(self, signal: str, meta: Dict, trade: Dict | None) -> Dict:
+        issues: List[str] = []
+        optimizations: List[str] = []
 
         if signal == "hold":
-            issues.append("No trade executed; verify signal thresholds are not overly strict.")
-            optimizations.append("Lower EMA/RSI trigger sensitivity for low-volatility regimes.")
+            failed = [k for k, v in meta.get("reason", {}).items() if not v]
+            issues.append(f"Entry filtered out by: {', '.join(failed) if failed else 'unknown'}")
+            optimizations.append("No trade is expected in noisy regime; keep BTC 4H long-only discipline.")
 
-        if is_meme and momentum < 0.03:
-            issues.append("Meme coin momentum weak; leverage may be too high for current regime.")
-            optimizations.append("Reduce meme leverage to 5-8x when momentum < 3%.")
-
-        if trade.get("status") not in {"closed", "filled"}:
-            issues.append("Order was not fully filled.")
-            optimizations.append("Add retry logic and fallback order type.")
+        if trade and trade.get("status") not in {"closed", "filled"}:
+            issues.append("Order not fully filled.")
+            optimizations.append("Add fallback order type and partial-fill handling.")
 
         if not issues:
-            issues.append("No immediate execution issue detected.")
-            optimizations.append("Continue monitoring rolling Sharpe and drawdown for adaptive tuning.")
+            issues.append("No immediate issue detected.")
+            optimizations.append("Track rolling PF/DD and tune ADX/Donchian thresholds with walk-forward validation.")
 
         review = {
             "ts": datetime.now(timezone.utc).isoformat(),
-            "trade_id": trade.get("id"),
-            "symbol": trade.get("symbol"),
+            "symbol": self.config.symbol,
             "signal": signal,
-            "momentum": momentum,
-            "is_meme": is_meme,
+            "meta": meta,
             "issues": issues,
             "optimizations": optimizations,
         }
-
         with self.review_log.open("a", encoding="utf-8") as f:
             f.write(json.dumps(review, ensure_ascii=False) + "\n")
-
         return review
 
-    def run_once(self, equity: float = 10_000.0) -> List[Dict]:
-        results = []
-        symbols = [(s, False) for s in self.config.major_symbols] + [(s, True) for s in self.config.meme_symbols]
+    def run_once(self, equity: float = 10_000.0) -> Dict:
+        df = self._fetch_ohlcv()
+        signal_meta = self._entry_signal(df)
+        signal = signal_meta["signal"]
 
-        for symbol, is_meme in symbols:
-            df = self._fetch_ohlcv(symbol)
-            signal, momentum = self._signal(df, is_meme=is_meme)
-            last_price = float(df.iloc[-1]["close"])
+        last = df.iloc[-1]
+        price = float(last["close"])
+        atr = float(last["atr"])
 
-            leverage = self._decide_leverage(is_meme=is_meme, momentum=momentum)
-            leverage = min(leverage, self.config.meme_max_leverage if is_meme else self.config.major_max_leverage)
+        if signal == "hold":
+            review = self._self_review(signal=signal, meta=signal_meta, trade=None)
+            return {"symbol": self.config.symbol, "action": "hold", "review": review}
 
-            if signal == "hold":
-                review = self._self_review(
-                    trade={"id": None, "symbol": symbol, "status": "closed"},
-                    signal=signal,
-                    momentum=momentum,
-                    is_meme=is_meme,
-                )
-                results.append({"symbol": symbol, "action": "hold", "review": review})
-                continue
+        leverage = min(self.config.leverage, self.config.max_leverage)
+        self._set_leverage(leverage)
 
-            self._set_leverage(symbol, leverage)
-            notional = self._position_notional(equity=equity, symbol=symbol, leverage=leverage, is_meme=is_meme)
-            trade = self._place_order(symbol=symbol, side=signal, notional=notional, price=last_price)
-            review = self._self_review(trade=trade, signal=signal, momentum=momentum, is_meme=is_meme)
+        notional = self._position_notional(equity=equity, price=price, atr=atr)
+        amount = notional / max(price, 1e-9)
+        trade = self._order("buy", amount)
 
-            results.append(
-                {
-                    "symbol": symbol,
-                    "action": signal,
-                    "is_meme": is_meme,
-                    "leverage": leverage,
-                    "price": last_price,
-                    "notional": notional,
-                    "trade": trade,
-                    "review": review,
-                }
-            )
+        stop_loss = price - self.config.atr_stop_mult * atr
+        tp1 = price + self.config.tp1_atr_mult * atr
+        tp2 = price + self.config.tp2_atr_mult * atr
 
-        return results
+        review = self._self_review(signal=signal, meta=signal_meta, trade=trade)
+        return {
+            "symbol": self.config.symbol,
+            "action": "buy",
+            "timeframe": self.config.timeframe,
+            "direction": "long_only",
+            "leverage": leverage,
+            "price": price,
+            "atr": atr,
+            "notional": notional,
+            "amount": amount,
+            "risk_plan": {
+                "stop_loss": stop_loss,
+                "tp1": tp1,
+                "tp2": tp2,
+                "tp1_reduce_ratio": self.config.tp1_reduce_ratio,
+            },
+            "trade": trade,
+            "review": review,
+        }
 
 
 def main() -> None:
     cfg = StrategyConfig(dry_run=True)
-    strategy = OKXCryptoQuantStrategy(cfg)
-    output = strategy.run_once(equity=10_000)
-    print(json.dumps(output, ensure_ascii=False, indent=2))
+    strategy = OKXBTC4HLongOnlyStrategy(cfg)
+    result = strategy.run_once(equity=10_000)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
